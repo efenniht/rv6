@@ -65,6 +65,7 @@ pub unsafe fn kernel_main() {
         while !STARTED.load(Ordering::Acquire) {}
 
         println!("hart {} starting", cpuid());
+        println!("hart {} starting", cpuid());
 
         // Turn on paging.
         kvminithart();
