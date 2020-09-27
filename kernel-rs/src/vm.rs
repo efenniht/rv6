@@ -1,7 +1,7 @@
 use crate::libc;
 use crate::{
     kalloc::{kalloc, kfree},
-    memlayout::{CLINT, KERNBASE, PHYSTOP, PLIC, TRAMPOLINE, UART0, VIRTIO0},
+    memlayout::{CLINT, FINISHER, KERNBASE, PHYSTOP, PLIC, TRAMPOLINE, UART0, VIRTIO0},
     println,
     riscv::{
         make_satp, pa2pte, pgrounddown, pgroundup, pte2pa, pte_flags, px, sfence_vma, w_satp,
@@ -33,6 +33,9 @@ pub static mut KERNEL_PAGETABLE: PagetableT = ptr::null_mut();
 pub unsafe fn kvminit() {
     KERNEL_PAGETABLE = kalloc() as PagetableT;
     ptr::write_bytes(KERNEL_PAGETABLE as *mut libc::CVoid, 0, PGSIZE);
+
+    // SiFive Test Finisher MMIO
+    kvmmap(FINISHER, FINISHER, PGSIZE, PTE_R | PTE_W);
 
     // uart registers
     kvmmap(UART0, UART0, PGSIZE, PTE_R | PTE_W);
