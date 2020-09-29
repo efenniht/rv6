@@ -17,14 +17,16 @@ use crate::{
     file::Inode,
     log::log_write,
     param::{NINODE, ROOTDEV},
-    proc::{either_copyin, either_copyout, myproc},
+    proc::{either_copyin, either_copyout},
     sleeplock::Sleeplock,
     spinlock::Spinlock,
     stat::{Stat, T_DIR},
-    string::{strncmp, strncpy},
 };
 use core::mem;
 use core::{ops::DerefMut, ptr};
+
+mod path;
+pub use path::{FileName, Path};
 
 /// Disk layout:
 /// [ boot block | super block | log | inode blocks |
@@ -59,10 +61,34 @@ pub struct Superblock {
     bmapstart: u32,
 }
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default)]
 pub struct Dirent {
     pub inum: u16,
     name: [u8; DIRSIZ],
+}
+
+impl Dirent {
+    /// Fill in name. If name is shorter than DIRSIZ, NUL character is appended as
+    /// terminator.
+    ///
+    /// `name` must contains no NUL characters, but this is not a safety invariant.
+    fn set_name(&mut self, name: &FileName) {
+        let name = name.as_bytes();
+        if name.len() == DIRSIZ {
+            self.name.copy_from_slice(&name);
+        } else {
+            self.name[..name.len()].copy_from_slice(&name);
+            self.name[name.len()] = 0;
+        }
+    }
+
+    /// Returns slice which exactly contains `name`.
+    ///
+    /// It contains no NUL characters.
+    fn get_name(&self) -> &FileName {
+        let len = self.name.iter().position(|ch| *ch == 0).unwrap_or(DIRSIZ);
+        unsafe { FileName::from_bytes(&self.name[..len]) }
+    }
 }
 
 /// On-disk inode structure
@@ -644,14 +670,11 @@ pub unsafe fn stati(ip: *mut Inode, mut st: *mut Stat) {
     (*st).size = (*ip).size as usize;
 }
 
-/// Directories
-pub unsafe fn namecmp(s: *const u8, t: *const u8) -> i32 {
-    strncmp(s, t, DIRSIZ as u32)
-}
+// Directories
 
 /// Look for a directory entry in a directory.
 /// If found, set *poff to byte offset of entry.
-pub unsafe fn dirlookup(dp: *mut Inode, name: *mut u8, poff: *mut u32) -> *mut Inode {
+pub unsafe fn dirlookup(dp: *mut Inode, name: &FileName, poff: *mut u32) -> *mut Inode {
     let mut off: u32 = 0;
     let mut de: Dirent = Default::default();
     if (*dp).typ as i32 != T_DIR {
@@ -668,7 +691,7 @@ pub unsafe fn dirlookup(dp: *mut Inode, name: *mut u8, poff: *mut u32) -> *mut I
         {
             panic!("dirlookup read");
         }
-        if de.inum as i32 != 0 && namecmp(name, de.name.as_mut_ptr()) == 0 {
+        if de.inum as i32 != 0 && name == de.get_name() {
             // entry matches path element
             if !poff.is_null() {
                 *poff = off
@@ -681,7 +704,9 @@ pub unsafe fn dirlookup(dp: *mut Inode, name: *mut u8, poff: *mut u32) -> *mut I
 }
 
 /// Write a new directory entry (name, inum) into the directory dp.
-pub unsafe fn dirlink(dp: *mut Inode, name: *mut u8, inum: u32) -> i32 {
+///
+/// `name` must not contain any NUL characters.
+pub unsafe fn dirlink(dp: *mut Inode, name: &FileName, inum: u32) -> i32 {
     let mut de: Dirent = Default::default();
 
     // Check that name is not present.
@@ -709,8 +734,9 @@ pub unsafe fn dirlink(dp: *mut Inode, name: *mut u8, inum: u32) -> i32 {
         }
         off = (off as usize).wrapping_add(::core::mem::size_of::<Dirent>()) as i32
     }
-    strncpy(de.name.as_mut_ptr(), name, DIRSIZ as i32);
+
     de.inum = inum as u16;
+    de.set_name(name);
     if (*dp).write(
         0,
         &mut de as *mut Dirent as usize,
@@ -722,96 +748,4 @@ pub unsafe fn dirlink(dp: *mut Inode, name: *mut u8, inum: u32) -> i32 {
         panic!("dirlink");
     }
     0
-}
-
-/// Paths
-///
-/// Copy the next path element from path into name.
-/// Return a pointer to the element following the copied one.
-/// The returned path has no leading slashes,
-/// so the caller can check *path=='\0' to see if the name is the last one.
-/// If no name to remove, return 0.
-///
-/// Examples:
-///   skipelem("a/bb/c", name) = "bb/c", setting name = "a"
-///   skipelem("///a//bb", name) = "bb", setting name = "a"
-///   skipelem("a", name) = "", setting name = "a"
-///   skipelem("", name) = skipelem("////", name) = 0
-unsafe fn skipelem(mut path: *mut u8, name: *mut u8) -> *mut u8 {
-    while *path as i32 == '/' as i32 {
-        path = path.offset(1)
-    }
-    if *path as i32 == 0 {
-        return ptr::null_mut();
-    }
-    let s: *mut u8 = path;
-    while *path as i32 != '/' as i32 && *path as i32 != 0 {
-        path = path.offset(1)
-    }
-    let len: i32 = path.offset_from(s) as i64 as i32;
-    if len >= DIRSIZ as i32 {
-        ptr::copy(s as *const libc::CVoid, name as *mut libc::CVoid, DIRSIZ);
-    } else {
-        ptr::copy(
-            s as *const libc::CVoid,
-            name as *mut libc::CVoid,
-            len as usize,
-        );
-        *name.offset(len as isize) = 0
-    }
-    while *path as i32 == '/' as i32 {
-        path = path.offset(1)
-    }
-    path
-}
-
-/// Look up and return the inode for a path name.
-/// If parent != 0, return the inode for the parent and copy the final
-/// path element into name, which must have room for DIRSIZ bytes.
-/// Must be called inside a transaction since it calls Inode::put().
-unsafe fn namex(mut path: *mut u8, nameiparent_0: i32, name: *mut u8) -> *mut Inode {
-    let mut ip: *mut Inode;
-
-    if *path as i32 == '/' as i32 {
-        ip = iget(ROOTDEV as u32, ROOTINO)
-    } else {
-        ip = (*(*myproc()).cwd).idup()
-    }
-    loop {
-        path = skipelem(path, name);
-        if path.is_null() {
-            break;
-        }
-        (*ip).lock();
-        if (*ip).typ as i32 != T_DIR {
-            (*ip).unlockput();
-            return ptr::null_mut();
-        }
-        if nameiparent_0 != 0 && *path as i32 == '\u{0}' as i32 {
-            // Stop one level early.
-            (*ip).unlock();
-            return ip;
-        }
-        let next: *mut Inode = dirlookup(ip, name, ptr::null_mut());
-        if next.is_null() {
-            (*ip).unlockput();
-            return ptr::null_mut();
-        }
-        (*ip).unlockput();
-        ip = next
-    }
-    if nameiparent_0 != 0 {
-        (*ip).put();
-        return ptr::null_mut();
-    }
-    ip
-}
-
-pub unsafe fn namei(path: *mut u8) -> *mut Inode {
-    let mut name: [u8; DIRSIZ] = [0; DIRSIZ];
-    namex(path, 0, name.as_mut_ptr())
-}
-
-pub unsafe fn nameiparent(path: *mut u8, name: *mut u8) -> *mut Inode {
-    namex(path, 1, name)
 }
