@@ -6,7 +6,7 @@ use crate::{
     exec::exec,
     fcntl::FcntlFlags,
     file::{FileType, Inode, InodeGuard, RcFile},
-    fs::{Dirent, FileName, Path, DIRENTSIZE},
+    fs::{FileName, Path},
     kalloc::{kalloc, kfree},
     log::{begin_op, end_op},
     ok_or,
@@ -110,7 +110,7 @@ pub unsafe fn sys_link() -> usize {
     drop(ip);
     if let Ok((ptr2, name)) = Path::new(new).nameiparent() {
         let mut dp = (*ptr2).lock();
-        if (*ptr2).dev != (*ptr).dev || dp.dirlink(name, (*ptr).inum).is_err() {
+        if (*ptr2).dev != (*ptr).dev || dp.link(name, (*ptr).inum).is_err() {
             dp.unlockput();
         } else {
             dp.unlockput();
@@ -127,75 +127,32 @@ pub unsafe fn sys_link() -> usize {
     usize::MAX
 }
 
-impl InodeGuard<'_> {
-    /// Is the directory dp empty except for "." and ".." ?
-    unsafe fn isdirempty(&mut self) -> bool {
-        let mut de: Dirent = Default::default();
-        for off in (2 * DIRENTSIZE as u32..self.size).step_by(DIRENTSIZE) {
-            let bytes_read = self.read(
-                0,
-                &mut de as *mut Dirent as usize,
-                off as u32,
-                DIRENTSIZE as u32,
-            );
-            assert_eq!(bytes_read, Ok(DIRENTSIZE), "isdirempty: readi");
-            if de.inum != 0 {
-                return false;
-            }
-        }
-        true
-    }
-}
-
 pub unsafe fn sys_unlink() -> usize {
-    let mut de: Dirent = Default::default();
     let mut path: [u8; MAXPATH] = [0; MAXPATH];
     let path = ok_or!(argstr(0, &mut path), return usize::MAX);
+
     begin_op();
     let (ptr, name) = ok_or!(Path::new(path).nameiparent(), {
         end_op();
         return usize::MAX;
     });
     let mut dp = (*ptr).lock();
-
-    // Cannot unlink "." or "..".
-    if !(name.as_bytes() == b"." || name.as_bytes() == b"..") {
-        // TODO: use other Result related functions
-        if let Ok((ptr2, off)) = dp.dirlookup(&name) {
-            let mut ip = (*ptr2).lock();
-            if ip.nlink < 1 {
-                panic!("unlink: nlink < 1");
-            }
-            if ip.typ == T_DIR && !ip.isdirempty() {
-                ip.unlockput();
-            } else {
-                let bytes_write =
-                    dp.write(0, &mut de as *mut Dirent as usize, off, DIRENTSIZE as u32);
-                assert_eq!(bytes_write, Ok(DIRENTSIZE), "unlink: writei");
-                if ip.typ == T_DIR {
-                    dp.nlink -= 1;
-                    dp.update();
-                }
-                dp.unlockput();
-                ip.nlink -= 1;
-                ip.update();
-                ip.unlockput();
-                end_op();
-                return 0;
-            }
-        }
-    }
-
+    let ret = dp.unlink(name);
     dp.unlockput();
     end_op();
-    usize::MAX
+
+    if ret.is_ok() {
+        0
+    } else {
+        usize::MAX
+    }
 }
 
 unsafe fn create(path: &Path, typ: i16, major: u16, minor: u16) -> Result<InodeGuard<'static>, ()> {
     let (ptr, name) = path.nameiparent()?;
     let mut dp = (*ptr).lock();
     // TODO: use other Result related functions
-    if let Ok((ptr2, _)) = dp.dirlookup(&name) {
+    if let Ok((ptr2, _)) = dp.lookup(&name) {
         dp.unlockput();
         let ip = (*ptr2).lock();
         if typ == T_FILE && (ip.typ == T_FILE || ip.typ == T_DEVICE) {
@@ -221,11 +178,11 @@ unsafe fn create(path: &Path, typ: i16, major: u16, minor: u16) -> Result<InodeG
         dp.update();
 
         // No ip->nlink++ for ".": avoid cyclic ref count.
-        ip.dirlink(FileName::from_bytes(b"."), (*ptr2).inum)
-            .and_then(|_| ip.dirlink(FileName::from_bytes(b".."), (*ptr).inum))
+        ip.link(FileName::from_bytes(b"."), (*ptr2).inum)
+            .and_then(|_| ip.link(FileName::from_bytes(b".."), (*ptr).inum))
             .expect("create dots");
     }
-    dp.dirlink(&name, (*ptr2).inum).expect("create: dirlink");
+    dp.link(&name, (*ptr2).inum).expect("create: dirlink");
     dp.unlockput();
     Ok(ip)
 }

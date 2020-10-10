@@ -141,7 +141,7 @@ impl Path {
         while let Some((new_path, name)) = path.skipelem() {
             path = new_path;
 
-            let mut ip = (*ptr).lock();
+            let ip = (*ptr).lock();
             if ip.typ != T_DIR {
                 ip.unlockput();
                 return Err(());
@@ -151,7 +151,7 @@ impl Path {
                 drop(ip);
                 return Ok((ptr, Some(name)));
             }
-            let next = ip.dirlookup(name);
+            let next = ip.lookup(name);
             ip.unlockput();
             ptr = next?.0
         }

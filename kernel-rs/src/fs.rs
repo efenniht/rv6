@@ -22,7 +22,11 @@ use crate::{
     spinlock::Spinlock,
     stat::{Stat, T_DIR, T_NONE},
 };
-use core::{mem, ops::DerefMut, ptr};
+use core::{
+    mem::{self, MaybeUninit},
+    ops::DerefMut,
+    ptr,
+};
 
 mod path;
 pub use path::{FileName, Path};
@@ -61,7 +65,7 @@ pub struct Superblock {
 }
 
 /// dirent size
-pub const DIRENTSIZE: usize = mem::size_of::<Dirent>();
+pub const DIRENT_SIZE: usize = mem::size_of::<Dirent>();
 
 #[derive(Default)]
 pub struct Dirent {
@@ -94,8 +98,8 @@ impl Dirent {
 
     fn read_entry(&mut self, ip: &mut InodeGuard<'_>, off: u32, panic_msg: &'static str) {
         unsafe {
-            let bytes_read = ip.read(0, self as *mut Dirent as usize, off, DIRENTSIZE as u32);
-            assert_eq!(bytes_read, Ok(DIRENTSIZE), "{}", panic_msg)
+            let bytes_read = ip.read(0, self as *mut Dirent as usize, off, DIRENT_SIZE as u32);
+            assert_eq!(bytes_read, Ok(DIRENT_SIZE), "{}", panic_msg)
         }
     }
 }
@@ -218,34 +222,6 @@ impl InodeGuard<'_> {
         }
     }
 
-    // Directories
-    /// Write a new directory entry (name, inum) into the directory dp.
-    pub unsafe fn dirlink(&mut self, name: &FileName, inum: u32) -> Result<(), ()> {
-        let mut de: Dirent = Default::default();
-
-        // Check that name is not present.
-        if let Ok((ip, _)) = self.dirlookup(name) {
-            (*ip).put();
-            return Err(());
-        };
-
-        // Look for an empty Dirent.
-        let mut off: u32 = 0;
-        // TODO : Dirent를 순회하는 iterator 만들기 : DIRENTSIZE만큼씩 읽고, 그 결과가 DIRENTSIZE가 아니면 panic
-        while off < self.size {
-            de.read_entry(self, off, "dirlink read");
-            if de.inum == 0 {
-                break;
-            }
-            off = (off as usize).wrapping_add(DIRENTSIZE) as u32
-        }
-        de.inum = inum as u16;
-        de.set_name(name);
-        let bytes_write = self.write(0, &mut de as *mut Dirent as usize, off, DIRENTSIZE as u32);
-        assert_eq!(bytes_write, Ok(DIRENTSIZE), "dirlink");
-        Ok(())
-    }
-
     /// Copy a modified in-memory inode to disk.
     /// Must be called after every change to an ip->xxx field
     /// that lives on disk, since i-node cache is write-through.
@@ -297,7 +273,7 @@ impl InodeGuard<'_> {
     /// If user_dst==1, then dst is a user virtual address;
     /// otherwise, dst is a kernel address.
     pub unsafe fn read(
-        &mut self,
+        &self,
         user_dst: i32,
         mut dst: usize,
         mut off: u32,
@@ -360,7 +336,10 @@ impl InodeGuard<'_> {
         }
         let mut tot: u32 = 0;
         while tot < n {
-            let bp = Buf::read(self.ptr.dev, self.bmap((off as usize).wrapping_div(BSIZE)));
+            let bp = Buf::read(
+                self.ptr.dev,
+                self.bmap_or_alloc((off as usize).wrapping_div(BSIZE)),
+            );
             let m = core::cmp::min(
                 n.wrapping_sub(tot),
                 (BSIZE as u32).wrapping_sub(off.wrapping_rem(BSIZE as u32)),
@@ -400,21 +379,6 @@ impl InodeGuard<'_> {
         Ok(n as usize)
     }
 
-    /// Look for a directory entry in a directory.
-    /// If found, return the entry and byte offset of entry.
-    pub unsafe fn dirlookup(&mut self, name: &FileName) -> Result<(*mut Inode, u32), ()> {
-        let mut de: Dirent = Default::default();
-        assert_eq!(self.typ, T_DIR, "dirlookup not DIR");
-        for off in (0..self.size).step_by(DIRENTSIZE) {
-            de.read_entry(self, off, "dirlookup read");
-            if de.inum as i32 != 0 && name == de.get_name() {
-                // entry matches path element
-                return Ok((iget(self.ptr.dev, de.inum as u32), off));
-            }
-        }
-        Err(())
-    }
-
     /// Inode content
     ///
     /// The content (data) associated with each inode is stored
@@ -423,7 +387,7 @@ impl InodeGuard<'_> {
     /// listed in block self->addrs[NDIRECT].
     /// Return the disk block address of the nth block in inode self.
     /// If there is no such block, bmap allocates one.
-    unsafe fn bmap(&mut self, mut bn: usize) -> u32 {
+    unsafe fn bmap_or_alloc(&mut self, mut bn: usize) -> u32 {
         let mut addr: u32;
         if bn < NDIRECT {
             addr = self.addrs[bn];
@@ -452,6 +416,144 @@ impl InodeGuard<'_> {
         }
         brelease(&mut *bp);
         addr
+    }
+
+    unsafe fn bmap(&self, mut bn: usize) -> u32 {
+        let mut addr: u32;
+        if bn < NDIRECT {
+            addr = self.addrs[bn];
+            return addr;
+        }
+        bn = (bn).wrapping_sub(NDIRECT);
+
+        assert!(bn < NINDIRECT, "bmap: out of range");
+        // Load indirect block, allocating if necessary.
+        addr = self.addrs[NDIRECT];
+        if addr == 0 {
+            return 0;
+        }
+        let bp: *mut Buf = Buf::read(self.ptr.dev, addr);
+        let a: *mut u32 = (*bp).inner.data.as_mut_ptr() as *mut u32;
+        addr = *a.add(bn);
+        brelease(&mut *bp);
+        addr
+    }
+}
+
+impl InodeGuard<'_> {
+    fn read_entry(&self, idx: usize) -> Result<Dirent, ()> {
+        let mut entry = MaybeUninit::<Dirent>::uninit();
+        let bytes_read = unsafe {
+            self.read(
+                0,
+                entry.as_mut_ptr() as _,
+                (idx * DIRENT_SIZE) as _,
+                DIRENT_SIZE as _,
+            )?
+        };
+
+        if bytes_read == DIRENT_SIZE {
+            Ok(unsafe { entry.assume_init() })
+        } else {
+            Err(())
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = Result<Dirent, ()>> + '_ {
+        (0..self.len())
+            .into_iter()
+            .map(move |idx| self.read_entry(idx))
+    }
+
+    fn len(&self) -> usize {
+        (self.size as usize) / DIRENT_SIZE
+    }
+
+    /// Look for a directory entry in a directory.
+    /// If found, return the entry and its index.
+    pub unsafe fn lookup(&self, name: &FileName) -> Result<(*mut Inode, usize), ()> {
+        for (idx, entry) in self.iter().enumerate() {
+            let entry = entry.expect("dirlookup read");
+            if entry.inum != 0 && name == entry.get_name() {
+                // entry matches path element
+                return Ok((iget(self.ptr.dev, entry.inum as u32), idx));
+            }
+        }
+        Err(())
+    }
+
+    /// Write a new directory entry (name, inum) into the directory dp.
+    pub unsafe fn link(&mut self, name: &FileName, inum: u32) -> Result<(), ()> {
+        let mut de: Dirent = Default::default();
+
+        // Check that name is not present.
+        if let Ok((ip, _)) = self.lookup(name) {
+            (*ip).put();
+            return Err(());
+        };
+
+        // Look for an empty Dirent.
+        let idx = self
+            .iter()
+            .position(|entry| entry.expect("dirlink read").inum == 0)
+            .unwrap_or(self.len());
+
+        de.inum = inum as u16;
+        de.set_name(name);
+        let bytes_write = self.write(
+            0,
+            &mut de as *mut Dirent as usize,
+            (idx * DIRENT_SIZE) as _,
+            DIRENT_SIZE as u32,
+        );
+        assert_eq!(bytes_write, Ok(DIRENT_SIZE), "dirlink");
+        Ok(())
+    }
+
+    pub unsafe fn unlink(&mut self, name: &FileName) -> Result<(), ()> {
+        // Cannot unlink "." or "..".
+        if name.as_bytes() == b"." || name.as_bytes() == b".." {
+            return Err(());
+        }
+
+        let (ptr2, idx) = self.lookup(name)?;
+
+        let mut ip = (*ptr2).lock();
+        if ip.nlink < 1 {
+            panic!("unlink: nlink < 1");
+        }
+
+        if ip.typ == T_DIR && !ip.is_empty() {
+            ip.unlockput();
+            return Err(());
+        }
+
+        let mut de = Dirent::default();
+        let bytes_write = self.write(
+            0,
+            &mut de as *mut Dirent as usize,
+            (idx * DIRENT_SIZE) as _,
+            DIRENT_SIZE as u32,
+        );
+        assert_eq!(bytes_write, Ok(DIRENT_SIZE), "unlink: writei");
+
+        if ip.typ == T_DIR {
+            self.nlink -= 1;
+            self.update();
+        }
+
+        ip.nlink -= 1;
+        ip.update();
+        ip.unlockput();
+        return Ok(());
+    }
+
+    /// Is the directory empty except for "." and ".." ?
+    pub unsafe fn is_empty(&self) -> bool {
+        self.iter()
+            .skip(2)
+            .position(|entry| entry.expect("is_empty: readi").inum != 0)
+            .is_none()
     }
 }
 

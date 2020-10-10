@@ -173,7 +173,7 @@ impl File {
         match &mut self.typ {
             FileType::Pipe { pipe } => pipe.read(addr, usize::try_from(n).unwrap_or(0)),
             FileType::Inode { ip, off } => {
-                let mut ip = (**ip).lock();
+                let ip = (**ip).lock();
                 let ret = ip.read(1, addr, *off, n as u32);
                 if let Ok(v) = ret {
                     *off = off.wrapping_add(v as u32);
