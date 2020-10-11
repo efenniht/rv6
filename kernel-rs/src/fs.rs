@@ -17,6 +17,7 @@ use crate::{
     file::{Inode, InodeGuard, InodeInner},
     log::log_write,
     param::{NINODE, ROOTDEV},
+    pool::{PoolRef, RcPool, TaggedBox},
     proc::{either_copyin, either_copyout},
     sleeplock::SleeplockWIP,
     spinlock::Spinlock,
@@ -24,7 +25,6 @@ use crate::{
 };
 use core::{
     mem::{self, MaybeUninit},
-    ops::DerefMut,
     ptr,
 };
 
@@ -199,17 +199,34 @@ struct Dinode {
 /// dev, and inum.  One must hold ip->lock in order to
 /// read or write that inode's ip->valid, ip->size, ip->type, &c.
 
-static mut ICACHE: Spinlock<[Inode; NINODE]> = Spinlock::new("ICACHE", [Inode::zeroed(); NINODE]);
+struct InodeCache {
+    pool: Spinlock<RcPool<Inode, NINODE>>,
+}
+
+static ICACHE: InodeCache = InodeCache::new();
+
+pub struct InodeCacheRef(());
+
+unsafe impl PoolRef for InodeCacheRef {
+    type Target = Spinlock<RcPool<Inode, NINODE>>;
+
+    fn deref() -> &'static Self::Target {
+        &ICACHE.pool
+    }
+}
+
+pub type RcInode = TaggedBox<InodeCacheRef, Inode>;
+
+impl InodeCache {
+    pub const fn new() -> Self {
+        Self {
+            pool: Spinlock::new("ICACHE", RcPool::new()),
+        }
+    }
+}
 
 //TODO(@kimjungwow) : move inode-related methods to another file
 impl InodeGuard<'_> {
-    /// Common idiom: unlock, then put.
-    pub unsafe fn unlockput(self) {
-        let ptr = self.ptr;
-        drop(self);
-        ptr.put();
-    }
-
     /// Copy stat information from inode.
     /// Caller must hold ip->lock.
     pub unsafe fn stat(&self) -> Stat {
@@ -440,6 +457,20 @@ impl InodeGuard<'_> {
     }
 }
 
+impl InodeInner {
+    fn new() -> Self {
+        Self {
+            valid: false,
+            typ: 0,
+            major: 0,
+            minor: 0,
+            nlink: 0,
+            size: 0,
+            addrs: [0; 13],
+        }
+    }
+}
+
 impl InodeGuard<'_> {
     fn read_entry(&self, idx: usize) -> Result<Dirent, ()> {
         let mut entry = MaybeUninit::<Dirent>::uninit();
@@ -471,7 +502,7 @@ impl InodeGuard<'_> {
 
     /// Look for a directory entry in a directory.
     /// If found, return the entry and its index.
-    pub unsafe fn lookup(&self, name: &FileName) -> Result<(*mut Inode, usize), ()> {
+    pub unsafe fn lookup(&self, name: &FileName) -> Result<(RcInode, usize), ()> {
         for (idx, entry) in self.iter().enumerate() {
             let entry = entry.expect("dirlookup read");
             if entry.inum != 0 && name == entry.get_name() {
@@ -487,10 +518,9 @@ impl InodeGuard<'_> {
         let mut de: Dirent = Default::default();
 
         // Check that name is not present.
-        if let Ok((ip, _)) = self.lookup(name) {
-            (*ip).put();
+        if self.lookup(name).is_ok() {
             return Err(());
-        };
+        }
 
         // Look for an empty Dirent.
         let idx = self
@@ -516,15 +546,14 @@ impl InodeGuard<'_> {
             return Err(());
         }
 
-        let (ptr2, idx) = self.lookup(name)?;
+        let (inode, idx) = self.lookup(name)?;
 
-        let mut ip = (*ptr2).lock();
+        let mut ip = inode.lock();
         if ip.nlink < 1 {
             panic!("unlink: nlink < 1");
         }
 
         if ip.typ == T_DIR && !ip.is_empty() {
-            ip.unlockput();
             return Err(());
         }
 
@@ -544,7 +573,6 @@ impl InodeGuard<'_> {
 
         ip.nlink -= 1;
         ip.update();
-        ip.unlockput();
         return Ok(());
     }
 
@@ -558,20 +586,11 @@ impl InodeGuard<'_> {
 }
 
 impl Inode {
-    /// Increment reference count for ip.
-    /// Returns ip to enable ip = idup(ip1) idiom.
-    pub unsafe fn idup(&mut self) -> *mut Self {
-        let _inode = ICACHE.lock();
-        self.ref_0 += 1;
-        self
-    }
-
     /// Lock the given inode.
     /// Reads the inode from disk if necessary.
     pub unsafe fn lock(&self) -> InodeGuard<'_> {
-        assert!(self.ref_0 >= 1, "Inode::lock");
         let mut guard = self.inner.lock();
-        if !self.inner.get_mut_unchecked().valid {
+        if !guard.valid {
             let bp: *mut Buf = Buf::read(self.dev, SB.iblock(self.inum));
             let dip: *mut Dinode = ((*bp).inner.data.as_mut_ptr() as *mut Dinode)
                 .add((self.inum as usize).wrapping_rem(IPB));
@@ -585,50 +604,13 @@ impl Inode {
             guard.valid = true;
             assert_ne!(guard.typ, T_NONE, "Inode::lock: no type");
         };
-        InodeGuard::new(guard, &*self)
-    }
-
-    /// Drop a reference to an in-memory inode.
-    /// If that was the last reference, the inode cache entry can
-    /// be recycled.
-    /// If that was the last reference and the inode has no links
-    /// to it, free the inode (and its content) on disk.
-    /// All calls to Inode::put() must be inside a transaction in
-    /// case it has to free the inode.
-    #[allow(clippy::cast_ref_to_mut)]
-    pub unsafe fn put(&self) {
-        let mut inode = ICACHE.lock();
-
-        if self.ref_0 == 1
-            && self.inner.get_mut_unchecked().valid
-            && self.inner.get_mut_unchecked().nlink == 0
-        {
-            // inode has no links and no other references: truncate and free.
-
-            // self->ref == 1 means no other process can have self locked,
-            // so this acquiresleep() won't block (or deadlock).
-            let mut ip = self.lock();
-
-            drop(inode);
-
-            ip.itrunc();
-            ip.typ = 0;
-            ip.update();
-            ip.valid = false;
-
-            drop(ip);
-
-            inode = ICACHE.lock();
-        }
-        //TODO : Use better code
-        *(&self.ref_0 as *const _ as *mut i32) -= 1;
-        drop(inode);
+        InodeGuard::new(guard, self)
     }
 
     /// Allocate an inode on device dev.
     /// Mark it as allocated by  giving it type type.
     /// Returns an unlocked but allocated and referenced inode.
-    pub unsafe fn alloc(dev: u32, typ: i16) -> *mut Inode {
+    pub unsafe fn alloc(dev: u32, typ: i16) -> RcInode {
         for inum in 1..SB.ninodes {
             let bp = Buf::read(dev, SB.iblock(inum));
             let dip = ((*bp).inner.data.as_mut_ptr() as *mut Dinode)
@@ -654,7 +636,6 @@ impl Inode {
         Self {
             dev: 0,
             inum: 0,
-            ref_0: 0,
             inner: SleeplockWIP::new(
                 "inode",
                 InodeInner {
@@ -667,6 +648,32 @@ impl Inode {
                     addrs: [0; 13],
                 },
             ),
+        }
+    }
+}
+
+impl Drop for Inode {
+    /// Drop a reference to an in-memory inode.
+    /// If that was the last reference, the inode cache entry can
+    /// be recycled.
+    /// If that was the last reference and the inode has no links
+    /// to it, free the inode (and its content) on disk.
+    /// All calls to Inode::put() must be inside a transaction in
+    /// case it has to free the inode.
+    fn drop(&mut self) {
+        if self.inner.get_mut().valid && self.inner.get_mut().nlink == 0 {
+            // inode has no links and no other references: truncate and free.
+
+            // self->ref == 1 means no other process can have self locked,
+            // so this acquiresleep() won't block (or deadlock).
+            unsafe {
+                let mut ip = self.lock();
+
+                ip.itrunc();
+                ip.typ = 0;
+                ip.update();
+                ip.valid = false;
+            }
         }
     }
 }
@@ -778,11 +785,9 @@ unsafe fn bfree(dev: i32, b: u32) {
     let mut bp: *mut Buf = Buf::read(dev as u32, SB.bblock(b));
     let bi: i32 = b.wrapping_rem(BPB) as i32;
     let m: i32 = (1) << (bi % 8);
-    assert_ne!(
-        (*bp).inner.data[(bi / 8) as usize] as i32 & m,
-        0,
-        "freeing free block"
-    );
+    if (*bp).inner.data[(bi / 8) as usize] as i32 & m == 0 {
+        panic!("freeing free block");
+    }
     (*bp).inner.data[(bi / 8) as usize] = ((*bp).inner.data[(bi / 8) as usize] as i32 & !m) as u8;
     log_write(bp);
     brelease(&mut *bp);
@@ -791,28 +796,14 @@ unsafe fn bfree(dev: i32, b: u32) {
 /// Find the inode with number inum on device dev
 /// and return the in-memory copy. Does not lock
 /// the inode and does not read it from disk.
-unsafe fn iget(dev: u32, inum: u32) -> *mut Inode {
-    let mut inode = ICACHE.lock();
-
-    // Is the inode already cached?
-    let mut empty: *mut Inode = ptr::null_mut();
-    for ip in &mut inode.deref_mut()[..] {
-        if (*ip).ref_0 > 0 && (*ip).dev == dev && (*ip).inum == inum {
-            (*ip).ref_0 += 1;
-            return ip;
-        }
-        if empty.is_null() && (*ip).ref_0 == 0 {
-            // Remember empty slot.
-            empty = ip
-        }
-    }
-
-    // Recycle an inode cache entry.
-    assert!(!empty.is_null(), "iget: no inodes");
-    let ip = empty;
-    (*ip).dev = dev;
-    (*ip).inum = inum;
-    (*ip).ref_0 = 1;
-    (*ip).inner.get_mut_unchecked().valid = false;
-    ip
+pub unsafe fn iget(dev: u32, inum: u32) -> RcInode {
+    InodeCacheRef::find_or_alloc(
+        Inode {
+            dev,
+            inum,
+            inner: SleeplockWIP::new("inode", InodeInner::new()),
+        },
+        |inode| inode.dev == dev && inode.inum == inum,
+    )
+    .expect("iget: no inodes")
 }

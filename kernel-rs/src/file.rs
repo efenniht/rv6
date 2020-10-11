@@ -1,6 +1,6 @@
 //! Support functions for system calls that involve file descriptors.
 use crate::{
-    fs::BSIZE,
+    fs::{RcInode, BSIZE},
     log::{begin_op, end_op},
     param::{MAXOPBLOCKS, NDEV, NFILE},
     pipe::AllocatedPipe,
@@ -12,6 +12,7 @@ use crate::{
 };
 use core::cmp;
 use core::convert::TryFrom;
+use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 
 pub struct File {
@@ -53,14 +54,6 @@ impl DerefMut for InodeGuard<'_> {
     }
 }
 
-/// Unlock the given inode.
-impl Drop for InodeGuard<'_> {
-    fn drop(&mut self) {
-        // TODO: Reasoning why.
-        assert!(self.ptr.ref_0 >= 1, "Inode::drop");
-    }
-}
-
 pub struct InodeInner {
     /// inode has been read from disk?
     pub valid: bool,
@@ -81,17 +74,22 @@ pub struct Inode {
     /// Inode number
     pub inum: u32,
 
-    /// Reference count
-    pub ref_0: i32,
-
     pub inner: SleeplockWIP<InodeInner>,
 }
 
 pub enum FileType {
     None,
-    Pipe { pipe: AllocatedPipe },
-    Inode { ip: *mut Inode, off: u32 },
-    Device { ip: *mut Inode, major: u16 },
+    Pipe {
+        pipe: AllocatedPipe,
+    },
+    Inode {
+        ip: ManuallyDrop<RcInode>,
+        off: u32,
+    },
+    Device {
+        ip: ManuallyDrop<RcInode>,
+        major: u16,
+    },
 }
 
 /// map major device number to device functions.
@@ -126,12 +124,6 @@ impl RcFile {
         // TODO: idiomatic initialization.
         FTableRef::alloc(File::init(readable, writable))
     }
-
-    /// Increment reference count of the file.
-    pub fn dup(&self) -> Self {
-        // SAFETY: `self` is allocated from `FTABLE`, ensured by given type parameter `FTableRef`.
-        unsafe { RcFile::from_unchecked(FTABLE.lock().dup(&*self)) }
-    }
 }
 
 impl File {
@@ -140,9 +132,9 @@ impl File {
     pub unsafe fn stat(&mut self, addr: usize) -> Result<(), ()> {
         let p: *mut Proc = myproc();
 
-        match self.typ {
+        match &self.typ {
             FileType::Inode { ip, .. } | FileType::Device { ip, .. } => {
-                let mut st = (*ip).lock().stat();
+                let mut st = ip.lock().stat();
                 if (*p)
                     .pagetable
                     .assume_init_mut()
@@ -254,11 +246,11 @@ impl Drop for File {
     fn drop(&mut self) {
         // TODO: Reasoning why.
         unsafe {
-            match self.typ {
+            match &mut self.typ {
                 FileType::Pipe { mut pipe } => pipe.close(self.writable),
                 FileType::Inode { ip, .. } | FileType::Device { ip, .. } => {
                     begin_op();
-                    (*ip).put();
+                    ManuallyDrop::drop(ip);
                     end_op();
                 }
                 _ => (),

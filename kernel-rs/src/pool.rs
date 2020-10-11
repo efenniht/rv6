@@ -27,15 +27,6 @@ impl<T, const CAPACITY: usize> RcPool<T, CAPACITY> {
             }; CAPACITY],
         }
     }
-
-    /// # Safety
-    ///
-    /// `rc` must be allocated from `self`.
-    // TODO: Make a RcPool trait and move this there.
-    pub unsafe fn dup(&mut self, rc: &UntaggedRc<T>) -> UntaggedRc<T> {
-        (*rc.ptr).ref_cnt += 1;
-        UntaggedRc { ptr: rc.ptr }
-    }
 }
 
 impl<T> Deref for UntaggedRc<T> {
@@ -71,10 +62,19 @@ pub trait Pool {
     /// Failable allocation.
     fn alloc(&self, val: Self::Data) -> Option<Self::PoolBox>;
 
+    fn find_or_alloc<F>(&self, val: Self::Data, f: F) -> Option<Self::PoolBox>
+    where
+        F: Fn(&Self::Data) -> bool;
+
     /// # Safety
     ///
     /// `pbox` must be allocated from the pool.
     unsafe fn dealloc(&self, pbox: Self::PoolBox);
+
+    /// # Safety
+    ///
+    /// `rc` must be allocated from `self`.
+    unsafe fn dup(&self, pbox: &Self::PoolBox) -> Self::PoolBox;
 }
 
 impl<T: 'static, const CAPACITY: usize> Pool for Spinlock<RcPool<T, CAPACITY>> {
@@ -88,6 +88,31 @@ impl<T: 'static, const CAPACITY: usize> Pool for Spinlock<RcPool<T, CAPACITY>> {
                 entry.data.write(val);
                 return Some(UntaggedRc { ptr: entry });
             }
+        }
+
+        None
+    }
+
+    fn find_or_alloc<F>(&self, val: T, f: F) -> Option<UntaggedRc<T>>
+    where
+        F: Fn(&T) -> bool,
+    {
+        let mut pool = self.lock();
+        let mut empty = None;
+        for (idx, entry) in pool.inner.iter_mut().enumerate() {
+            if empty.is_none() && entry.ref_cnt == 0 {
+                empty = Some(idx);
+            } else if entry.ref_cnt != 0 && f(unsafe { entry.data.assume_init_ref() }) {
+                entry.ref_cnt += 1;
+                return Some(UntaggedRc { ptr: entry });
+            }
+        }
+
+        if let Some(idx) = empty {
+            let entry = &mut pool.inner[idx];
+            entry.ref_cnt = 1;
+            entry.data.write(val);
+            return Some(UntaggedRc { ptr: entry });
         }
 
         None
@@ -112,7 +137,18 @@ impl<T: 'static, const CAPACITY: usize> Pool for Spinlock<RcPool<T, CAPACITY>> {
         mem::forget(rc);
 
         // Drop AFTER the pool lock is released, as dropping val may cause the current thread sleep.
+
+        // TODO: Defer drop may cause invariant break on get_or_alloc.
         mem::drop(val);
+    }
+
+    /// # Safety
+    ///
+    /// `rc` must be allocated from `self`.
+    unsafe fn dup(&self, rc: &UntaggedRc<T>) -> UntaggedRc<T> {
+        let _guard = self.lock();
+        (*rc.ptr).ref_cnt += 1;
+        UntaggedRc { ptr: rc.ptr }
     }
 }
 
@@ -133,6 +169,20 @@ pub unsafe trait PoolRef: Sized {
         val: <Self::Target as Pool>::Data,
     ) -> Option<TaggedBox<Self, <Self::Target as Pool>::Data>> {
         let alloc = Self::deref().alloc(val)?;
+        Some(TaggedBox {
+            alloc: ManuallyDrop::new(alloc),
+            _marker: PhantomData,
+        })
+    }
+
+    fn find_or_alloc<F>(
+        val: <Self::Target as Pool>::Data,
+        f: F,
+    ) -> Option<TaggedBox<Self, <Self::Target as Pool>::Data>>
+    where
+        F: Fn(&<Self::Target as Pool>::Data) -> bool,
+    {
+        let alloc = Self::deref().find_or_alloc(val, f)?;
         Some(TaggedBox {
             alloc: ManuallyDrop::new(alloc),
             _marker: PhantomData,
@@ -166,6 +216,15 @@ where
             alloc: ManuallyDrop::new(pbox),
             _marker: PhantomData,
         }
+    }
+}
+
+impl<P: PoolRef, T: 'static> Clone for TaggedBox<P, T>
+where
+    P::Target: Pool<Data = T>,
+{
+    fn clone(&self) -> Self {
+        unsafe { Self::from_unchecked(P::deref().dup(self)) }
     }
 }
 

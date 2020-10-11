@@ -3,7 +3,6 @@ use crate::{
     file::InodeGuard,
     fs::Path,
     log::{begin_op, end_op},
-    ok_or,
     param::MAXARG,
     proc::{myproc, proc_freepagetable, proc_pagetable, Proc},
     riscv::PGSIZE,
@@ -20,15 +19,9 @@ pub unsafe fn exec(path: &Path, argv: *mut *mut u8) -> Result<usize, ()> {
     let mut p: *mut Proc = myproc();
 
     begin_op();
-    let ptr = ok_or!(path.namei(), {
-        end_op();
-        return Err(());
-    });
-    let ip = (*ptr).lock();
-    let mut ip = scopeguard::guard(ip, |ip| {
-        ip.unlockput();
-        end_op();
-    });
+    let _transaction = scopeguard::guard((), |_| end_op());
+    let ptr = path.namei()?;
+    let mut ip = (*ptr).lock();
 
     // Check ELF header
     let bytes_read = ip.read(0, &mut elf as *mut _ as _, 0, mem::size_of::<ElfHdr>() as _)?;

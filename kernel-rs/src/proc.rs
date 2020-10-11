@@ -1,7 +1,7 @@
 use crate::libc;
 use crate::{
-    file::{Inode, RcFile},
-    fs::{fsinit, Path},
+    file::RcFile,
+    fs::{fsinit, Path, RcInode},
     kalloc::{kalloc, kfree},
     log::{begin_op, end_op},
     memlayout::{kstack, TRAMPOLINE, TRAPFRAME},
@@ -309,7 +309,7 @@ pub struct Proc {
     pub open_files: [Option<RcFile>; NOFILE],
 
     /// Current directory.
-    pub cwd: *mut Inode,
+    pub cwd: Option<RcInode>,
 
     /// Process name (debugging).
     pub name: [u8; 16],
@@ -379,7 +379,7 @@ impl Proc {
             tf: ptr::null_mut(),
             context: Context::zeroed(),
             open_files: [None; NOFILE],
-            cwd: ptr::null_mut(),
+            cwd: None,
             name: [0; 16],
         }
     }
@@ -415,9 +415,8 @@ impl Proc {
             *file = None;
         }
         begin_op();
-        (*self.cwd).put();
+        self.cwd = None;
         end_op();
-        self.cwd = ptr::null_mut();
     }
 }
 
@@ -558,7 +557,7 @@ impl ProcessSystem {
         );
         (*p).cwd = Path::new(CStr::from_bytes_with_nul_unchecked(b"/\x00"))
             .namei()
-            .unwrap_or(ptr::null_mut());
+            .ok();
         (*p).state = Procstate::RUNNABLE;
         (*p).lock.release();
     }
@@ -594,10 +593,10 @@ impl ProcessSystem {
         // Increment reference counts on open file descriptors.
         for i in 0..NOFILE {
             if let Some(file) = &(*p).open_files[i] {
-                (*np).open_files[i] = Some(file.dup())
+                (*np).open_files[i] = Some(file.clone())
             }
         }
-        (*np).cwd = (*(*p).cwd).idup();
+        (*np).cwd = (*p).cwd.clone();
         safestrcpy(
             (*np).name.as_mut_ptr(),
             (*p).name.as_mut_ptr(),

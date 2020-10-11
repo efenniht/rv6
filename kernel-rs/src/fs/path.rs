@@ -1,7 +1,8 @@
 use core::cmp;
+use core::hint::unreachable_unchecked;
 use cstr_core::CStr;
 
-use super::{iget, Inode, DIRSIZ, ROOTDEV, ROOTINO, T_DIR};
+use super::{iget, RcInode, DIRSIZ, ROOTDEV, ROOTINO, T_DIR};
 use crate::proc::myproc;
 
 #[derive(PartialEq)]
@@ -55,11 +56,11 @@ impl Path {
 
     // TODO: Following functions should return a safe type rather than `*mut Inode`.
 
-    pub unsafe fn namei(&self) -> Result<*mut Inode, ()> {
+    pub unsafe fn namei(&self) -> Result<RcInode, ()> {
         Ok(self.namex(false)?.0)
     }
 
-    pub unsafe fn nameiparent(&self) -> Result<(*mut Inode, &FileName), ()> {
+    pub unsafe fn nameiparent(&self) -> Result<(RcInode, &FileName), ()> {
         let (ip, name_in_path) = self.namex(true)?;
         let name_in_path = name_in_path.ok_or(())?;
         Ok((ip, name_in_path))
@@ -129,11 +130,18 @@ impl Path {
     /// If parent != 0, return the inode for the parent and copy the final
     /// path element into name, which must have room for DIRSIZ bytes.
     /// Must be called inside a transaction since it calls Inode::put().
-    unsafe fn namex(&self, parent: bool) -> Result<(*mut Inode, Option<&FileName>), ()> {
-        let mut ptr = if self.is_absolute() {
+    unsafe fn namex(&self, parent: bool) -> Result<(RcInode, Option<&FileName>), ()> {
+        let mut inode = if self.is_absolute() {
             iget(ROOTDEV as u32, ROOTINO)
         } else {
-            (*(*myproc()).cwd).idup()
+            match &(*myproc()).cwd {
+                Some(cwd) => cwd.clone(),
+                None => {
+                    // TODO: fix
+                    debug_assert!(false);
+                    unreachable_unchecked()
+                }
+            }
         };
 
         let mut path = self;
@@ -141,24 +149,22 @@ impl Path {
         while let Some((new_path, name)) = path.skipelem() {
             path = new_path;
 
-            let ip = (*ptr).lock();
+            let ip = inode.lock();
             if ip.typ != T_DIR {
-                ip.unlockput();
                 return Err(());
             }
             if parent && path.inner.is_empty() {
                 // Stop one level early.
                 drop(ip);
-                return Ok((ptr, Some(name)));
+                return Ok((inode, Some(name)));
             }
             let next = ip.lookup(name);
-            ip.unlockput();
-            ptr = next?.0
+            drop(ip);
+            inode = next?.0
         }
         if parent {
-            (*ptr).put();
             return Err(());
         }
-        Ok((ptr, None))
+        Ok((inode, None))
     }
 }
